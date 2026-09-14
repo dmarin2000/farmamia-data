@@ -1,0 +1,97 @@
+name: catalog-pipeline
+
+# Daily catalog content build (PLAN-update-strategy §6).
+# Fail-closed: any failure aborts and publishes nothing — the last-good
+# release stays live on R2 + the GitHub Releases mirror.
+#
+# The overlay is always built against the LAST PUBLISHED baseline (fetched
+# from the base URL), because that is what the app holds. The baseline
+# itself only changes on a manual `catalog-baseline` run (schema bump /
+# Q3 re-bake), in lockstep with the app that expects it (Q5).
+#
+# Required repo secrets: R2_ENDPOINT, R2_ACCESS_KEY_ID,
+#   R2_SECRET_ACCESS_KEY, R2_BUCKET
+# Required repo variable: CATALOG_BASE_URL (the catalog Worker origin)
+
+on:
+  schedule:
+    - cron: "0 6 * * *"        # 06:00 UTC daily (AIFA posts overnight)
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # pipeline is stdlib-only
+
+      # 1. fetch + validate sources (fail-closed, per-source staleness bands)
+      - name: Fetch sources
+        run: python3 scripts/download_sources.py --skip-unchanged
+
+      # 2. full candidate build
+      - name: Build candidate catalog
+        run: python3 scripts/build_catalog.py --db build/candidate.db
+
+      # 3. last published state -> prev baseline + last content version
+      - name: Fetch last published state
+        run: |
+          set -e
+          mkdir -p build
+          if curl -sf "${{ vars.CATALOG_BASE_URL }}/manifest.json" -o build/last_manifest.json; then
+            echo "  found last manifest (cv $(python3 -c "import json;print(json.load(open('build/last_manifest.json'))['content_version'])"))"
+            PREV_URL=$(python3 -c "import json;print(json.load(open('build/last_manifest.json'))['baseline']['url'])")
+            curl -sf "$PREV_URL" -o build/prev.db
+            sha256sum -c <(python3 -c "import json;m=json.load(open('build/last_manifest.json'));print(m['baseline']['sha256'],'build/prev.db')")
+            LAST_CV=$(python3 -c "import json;print(json.load(open('build/last_manifest.json'))['content_version'])")
+            echo "LAST_CV=$LAST_CV" >> "$GITHUB_ENV"
+          else
+            echo "  no manifest yet — first publish (overlay = views only)"
+            echo "LAST_CV=0" >> "$GITHUB_ENV"
+          fi
+
+      # 4. diff vs last baseline -> overlay (exit 42 = no content change)
+      - name: Diff vs last baseline
+        run: |
+          set -e
+          [ -f build/prev.db ] && PREV=build/prev.db || PREV=none
+          BSHA=$(sha256sum build/candidate.db | cut -d' ' -f1)
+          set +e
+          python3 scripts/diff_catalog.py --prev "$PREV" \
+            --cand build/candidate.db --out build/overlay.sqlite \
+            --baseline-sha "$BSHA" \
+            --content-version $(( LAST_CV + 1 ))
+          RC=$?
+          set -e
+          [ $RC -eq 42 ] && echo "::notice::no content change, nothing published" && exit 0
+          [ $RC -ne 0 ] && exit $RC
+          cp build/candidate.db build/published_baseline.db
+
+      # 5. stage manifest + upload (R2) — the published baseline is the
+      #    last one we diffed against (re-PUT, idempotent, content-addressed)
+      - name: Publish
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          [ -f build/published_baseline.db ] || cp build/candidate.db build/published_baseline.db
+          python3 scripts/publish.py \
+            --baseline build/published_baseline.db \
+            --overlay build/overlay.sqlite \
+            --base-url "${{ vars.CATALOG_BASE_URL }}" \
+            --upload --keep-dist
+
+      # 6. GitHub Releases mirror (app fallback host)
+      - name: Release mirror
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          VER=$(python3 -c "import json;print(json.load(open('dist/manifest.json'))['content_version'])")
+          gh release create "catalog-$VER" --title "catalog content $VER" \
+            dist/baselines/ dist/overlays/ dist/manifest.json --notes "auto"

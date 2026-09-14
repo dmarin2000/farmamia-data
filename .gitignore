@@ -1,0 +1,15 @@
+# pipeline artifacts & downloaded sources (re-fetched by scripts/download_sources.py)
+build/
+dist/
+sources/
+backups/
+*.zip
+*.db
+*.part
+# root-level source copies (provenance; canonical copies live in sources/)
+*.csv
+!curated/*.csv
+# reference screenshots
+*.png
+__pycache__/
+.DS_Store
