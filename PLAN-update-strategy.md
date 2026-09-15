@@ -374,16 +374,21 @@ lookup logic.
 
 ## 11. Phased rollout
 
-**P1 — pipeline + overlay (the core loop)**
+**P1 — pipeline + overlay (the core loop)** ✅ DONE 2026-09-14
 - `fetch_sources.py` + validation; `diff_catalog.py`; `publish.py`;
   Actions cron.
 - Build gains the `pa_confezioni` table (Q6).
-- App: manifest client, overlay ATTACH+views, hash verification,
-  blue/green baseline swap (Q5), settings "aggiornato al…".
-- `catalog_meta` gains `content_version` + per-source dates/shas.
-- No schema bump needed (overlay is a *separate file*; `EXPECTED_SCHEMA_VERSION`
-  stays 3) — the only app-visible contract change is the new key.
-- Exit: two real content builds published + applied on the emulator
+- App: manifest client (`CatalogRemote`), overlay ATTACH+TEMP views
+  (SQLite ≥3.4x rejects permanent views on attached dbs), sha256+size
+  verification, blue/green swap of both files (Q5), one-shot
+  "Dati aggiornati al …" toast.
+- `catalog_meta` gains `content_version` + per-source dates/shas; because
+  the baseline gained a table (`pa_confezioni`) this *was* a schema bump:
+  3 → 4 (build `SCHEMA_VERSION` + app `EXPECTED_SCHEMA_VERSION` +
+  `DataLayerInstrumentedTest` in lockstep).
+- Exit: two real content builds published + applied on the emulator ✅
+  (cv1 empty pass-through + cv2 real delta; `CatalogRemoteInstrumentedTest`
+  pulls the dist/ from 10.0.2.2:8080 on the AVD; suite 39/39 green).
   (offline-safe test: airplane mode keeps working).
 
 **P2 — curation automation**
