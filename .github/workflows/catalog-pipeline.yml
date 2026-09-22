@@ -29,7 +29,13 @@ jobs:
           python-version: "3.11"   # pipeline is stdlib-only
 
       # 1. fetch + validate sources (fail-closed, per-source staleness bands)
+      #    MIBACT_PROXY (optional secret): the Mibact DISPO host is a
+      #    TLS1.2-only box that can reject the runner egress; if both the
+      #    urllib and curl strategies fail, set this to a residential/Italian
+      #    egress proxy so the fetch can go through it.
       - name: Fetch sources
+        env:
+          MIBACT_PROXY: ${{ secrets.MIBACT_PROXY }}
         run: python3 scripts/download_sources.py --skip-unchanged
 
       # 2. full candidate build

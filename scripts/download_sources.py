@@ -40,10 +40,11 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
-import io
 import json
 import os
 import re
+import ssl
+import subprocess
 import sys
 import urllib.request
 import urllib.error
@@ -106,26 +107,99 @@ def make_opener(domain: str) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
 
-def fetch(opener, url: str, dest: str, timeout: int = 300) -> dict:
+def fetch(opener, url: str, dest: str, timeout: int = 300, getter=None) -> dict:
     """Download to <dest>.part. The caller validates the part, then
     promotes it with os.replace (fail-closed: the last-good file is
-    only touched after the new one is known good)."""
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with opener.open(req, timeout=timeout) as resp:
-        data = resp.read()
+    only touched after the new one is known good).
+
+    getter: optional callable (url, timeout) -> (bytes, headers) used
+    instead of the default urllib path (the Mibact host needs one)."""
+    if getter is not None:
+        data, headers = getter(url, timeout)
+        status = 200
+    else:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with opener.open(req, timeout=timeout) as resp:
+            data = resp.read()
+            status = resp.status
+            headers = resp.headers
     tmp = dest + ".part"
     with open(tmp, "wb") as f:
         f.write(data)
     return {
         "url": url,
-        "status": resp.status,
-        "etag": resp.headers.get("ETag"),
-        "last_modified": resp.headers.get("Last-Modified"),
-        "content_type": resp.headers.get("Content-Type"),
+        "status": status,
+        "etag": headers.get("ETag"),
+        "last_modified": headers.get("Last-Modified"),
+        "content_type": headers.get("Content-Type"),
         "bytes": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
         "part": tmp,
     }
+
+
+def _mibact_ssl_ctx() -> ssl.SSLContext:
+    """TLS1.2-pinned context. The Mibact host is a TLS1.2-only box; pinning
+    trims the TLS1.3 extensions from the ClientHello (changes the JA3), which
+    can slip past a WAF that rejects the default Python/OpenSSL 3.x profile."""
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+def _mibact_proxy() -> str | None:
+    return os.environ.get("MIBACT_PROXY") or os.environ.get("HTTPS_PROXY")
+
+
+def _mibact_urllib(url: str, timeout: int) -> tuple[bytes, dict]:
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+    handlers = [urllib.request.HTTPSHandler(context=_mibact_ssl_ctx())]
+    proxy = _mibact_proxy()
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*handlers)
+    with opener.open(req, timeout=timeout) as resp:
+        return resp.read(), dict(resp.headers)
+
+
+def _mibact_curl(url: str, timeout: int) -> tuple[bytes, dict]:
+    """Different TLS stack + header order than urllib (libcurl) — a distinct
+    client fingerprint. This is the strategy that works from most egress."""
+    cmd = ["curl", "-fsSL", "--max-time", str(timeout),
+           "--tlsv1.2", "--tls-max", "1.2", "-A", BROWSER_UA, "-o", "-", url]
+    proxy = _mibact_proxy()
+    if proxy:
+        cmd += ["-x", proxy]
+    r = subprocess.run(cmd, capture_output=True, timeout=timeout + 30)
+    if r.returncode != 0:
+        raise RuntimeError("curl rc=%d: %s" % (
+            r.returncode, r.stderr.decode("utf-8", "replace")[:300]))
+    return r.stdout, {}
+
+
+def mibact_fetch(url: str, timeout: int = 300) -> tuple[bytes, dict]:
+    """Resilient GET for the Mibact (dati.salute.gov.it) host. The server is
+    a single TLS1.2-only Fastweb residential box behind a client-filtering
+    proxy that rejects some egress (GitHub-hosted runners) mid-handshake with
+    SSLV3_ALERT_HANDSHAKE_FAILURE. Try, in order: urllib (TLS1.2-pinned) ->
+    curl subprocess -> (if MIBACT_PROXY set, both through it). Fail closed."""
+    errors = []
+    for label, fn in (("urllib", _mibact_urllib), ("curl", _mibact_curl)):
+        try:
+            data, headers = fn(url, timeout)
+            print(f"  [mibact] via {label} OK ({len(data)} bytes)")
+            return data, headers
+        except Exception as e:  # noqa: BLE001 - fail over to next strategy
+            errors.append(f"{label}: {type(e).__name__}: {e}")
+            print(f"  [mibact] via {label} FAILED: {type(e).__name__}: {e}")
+    raise SystemExit(
+        "ERROR: Mibact host (www.dati.salute.gov.it) unreachable by every strategy:\n  "
+        + "\n  ".join(errors)
+        + "\n  It is a single TLS1.2-only box rejecting this egress (IP/ASN or TLS\n"
+        + "  profile). Set a MIBACT_PROXY secret (residential/Italian egress) and\n"
+        + "  retry; the last published catalog stays live (fail-closed)."
+    )
 
 
 def sniff_header(path: str, encoding: str, expected: str) -> None:
@@ -203,8 +277,8 @@ def resolve_mibact(opener) -> tuple[str, str]:
     index.json) and the nested Drupal one
     `result.data.allNodeDataset.nodes[0].relationships` (the current
     /page-data/it/dataset/.../page-data.json). Accept either."""
-    with opener.open(MIBACT_PAGE_DATA, timeout=60) as resp:
-        data = json.load(io.TextIOWrapper(resp, encoding="utf-8"))
+    raw, _ = mibact_fetch(MIBACT_PAGE_DATA, timeout=60)
+    data = json.loads(raw.decode("utf-8"))
     rels = data.get("relationships", {}).get("field_listafile", [])
     if not rels:
         nodes = (((data.get("result") or {}).get("data") or {}).get(
@@ -297,7 +371,8 @@ def main() -> None:
                 print("  unchanged, skipping")
                 continue
 
-        meta = fetch(opener, url, local)
+        meta = fetch(opener, url, local,
+                     getter=mibact_fetch if name == "mibact_dispo" else None)
         # header sniff on the part, except for the DISPO zip (it is a zip;
         # its CSV is validated after extraction below)
         if not base.endswith(".zip"):

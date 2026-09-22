@@ -368,6 +368,7 @@ lookup logic.
 | curation rot (bridges pointing at revoked progressivi) | force-include keeps rows present; revoked device row → bridge resolves to a row with end dates → app already renders end date; obvious to user |
 | source staleness (Classe A/H copy 5 months old today) | staleness bands in validation (§6); `catalog_meta` dates visible in settings → users and we notice drift |
 | AIFA drive flakiness/403 for scripted clients | P1 probe with the exact curl the app/pipeline uses; proxy fallback; fail-closed keeps last good |
+| Mibact DISPO host rejects runner egress (hit 2026-09-22: `SSLV3_ALERT_HANDSHAKE_FAILURE`) | `www.dati.salute.gov.it` = single **TLS1.2-only Fastweb residential box** (93.148.195.97, AS30722) behind a client-filtering proxy; it rejects the GitHub runner's TLS ClientHello (AIFA is on different infra → works). Fix: `mibact_fetch()` strategy chain — urllib (TLS1.2-pinned ctx) → curl subprocess (distinct TLS stack/fingerprint) → optional `MIBACT_PROXY` secret; fail-closed keeps last publish. Verify which layer wins on next run; if both fail, set the proxy secret |
 | schema_version/content_version confusion | plane split is documented in `catalog_meta` itself (a `planes` key) and in the app constant comments |
 
 ---
