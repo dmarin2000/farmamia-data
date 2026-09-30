@@ -59,10 +59,12 @@ jobs:
           set -e
           PAGES_BASE="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY##*/}"
           mkdir -p build
-          if curl -sf "${PAGES_BASE}/manifest.json" -o build/last_manifest.json; then
+          if curl -sfL "${PAGES_BASE}/manifest.json" -o build/last_manifest.json; then
             echo "  found last manifest (cv $(python3 -c "import json;print(json.load(open('build/last_manifest.json'))['content_version'])"))"
             PREV_URL=$(python3 -c "import json;print(json.load(open('build/last_manifest.json'))['baseline']['url'])")
-            curl -sf "$PREV_URL" -o build/prev.db
+            # -L: release download URLs 302 to the release-assets CDN; without
+            # follow curl writes the empty redirect body (sha256 mismatch)
+            curl -sfL "$PREV_URL" -o build/prev.db
             sha256sum -c <(python3 -c "import json;m=json.load(open('build/last_manifest.json'));print(m['baseline']['sha256'],'build/prev.db')")
             LAST_CV=$(python3 -c "import json;print(json.load(open('build/last_manifest.json'))['content_version'])")
             echo "LAST_CV=$LAST_CV" >> "$GITHUB_ENV"
