@@ -17,9 +17,12 @@ app falls back to (kept in sync by the Actions workflow).
 
 Environment for --upload:
   R2_ENDPOINT        https://<account>.r2.cloudflarestorage.com
+                     (or any S3-compatible endpoint, e.g. https://s3.cubbit.eu)
   R2_ACCESS_KEY_ID   scoped S3 API token
   R2_SECRET_ACCESS_KEY
   R2_BUCKET
+  S3_REGION          optional; SigV4 signing region. "auto" (default) for R2,
+                     "eu-west-1" for Cubbit DS3
 
 Usage:
   python3 publish.py --baseline build/candidate.db --overlay build/overlay.sqlite \
@@ -51,7 +54,9 @@ def s3_put(endpoint: str, bucket: str, key: str, data: bytes,
     access = os.environ["R2_ACCESS_KEY_ID"]
     secret = os.environ["R2_SECRET_ACCESS_KEY"]
     host = endpoint.split("//", 1)[1].split("/")[0]
-    region = "auto"  # R2 ignores the region; SigV4 only needs it signed
+    # R2 ignores the region; other S3-compatible stores need their own
+    # (Cubbit DS3 = "eu-west-1"). Empty/unset -> "auto" (R2 behavior).
+    region = os.environ.get("S3_REGION") or "auto"
     service = "s3"
     now = dt.datetime.now(dt.timezone.utc)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
@@ -101,7 +106,13 @@ def main() -> None:
     ap.add_argument("--dist", default=os.path.join(os.path.dirname(
         os.path.abspath(__file__)), "..", "dist"))
     ap.add_argument("--base-url", default="https://catalog.example.invalid",
-                    help="public base URL the Worker serves")
+                    help="public base URL the manifest/overlay live under")
+    ap.add_argument("--baseline-url", default=None,
+                    help="full URL of the baseline object (default: "
+                         "<base-url>/<content-addressed key>). Use when the "
+                         "baseline is hosted elsewhere, e.g. a GitHub Release "
+                         "asset, because the ~124 MB db exceeds the 100 MB "
+                         "git push limit of the Pages branch")
     ap.add_argument("--upload", action="store_true",
                     help="PUT staged files to R2 (S3 API)")
     ap.add_argument("--keep-dist", action="store_true")
@@ -138,7 +149,7 @@ def main() -> None:
         "schema_version": bmeta["schema_version"],
         "content_version": cv,
         "baseline": {
-            "url": f"{args.base_url}/{base_key}",
+            "url": args.baseline_url or f"{args.base_url}/{base_key}",
             "sha256": base_sha,
             "size": os.path.getsize(os.path.join(dist, base_key)),
         },

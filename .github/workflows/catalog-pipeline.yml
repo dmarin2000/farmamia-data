@@ -2,21 +2,30 @@ name: catalog-pipeline
 
 # Daily catalog content build (PLAN-update-strategy §6).
 # Fail-closed: any failure aborts and publishes nothing — the last-good
-# release stays live on R2 + the GitHub Releases mirror.
+# release stays live (manifest + overlay on GitHub Pages, baseline as a
+# GitHub Release asset).
 #
-# The overlay is always built against the LAST PUBLISHED baseline (fetched
-# from the base URL), because that is what the app holds. The baseline
-# itself only changes on a manual `catalog-baseline` run (schema bump /
-# Q3 re-bake), in lockstep with the app that expects it (Q5).
+# Host layout (no Cloudflare, no bucket, no credit card):
+#   manifest.json + current overlay -> gh-pages branch (GitHub Pages)
+#   baseline db (~124 MB > 100 MB git push limit) -> Release "baseline-<sha12>"
+#     (Releases API: 2 GiB per asset, no bandwidth limit; uploaded only when
+#      the baseline sha changes)
 #
-# Required repo secrets: R2_ENDPOINT, R2_ACCESS_KEY_ID,
-#   R2_SECRET_ACCESS_KEY, R2_BUCKET
-# Required repo variable: CATALOG_BASE_URL (the catalog Worker origin)
+# The overlay is the CUMULATIVE diff against the last published baseline
+# (the one the app holds). The baseline itself only changes on the first
+# publish or a manual `rebase` dispatch (schema bump / Q3 re-bake), in
+# lockstep with the app that expects it (Q5). Content days therefore publish
+# only the small overlay — the app never re-downloads the 124 MB baseline.
 
 on:
   schedule:
     - cron: "0 6 * * *"        # 06:00 UTC daily (AIFA posts overnight)
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      rebase:
+        description: "Publish the candidate as a NEW baseline (schema bump / periodic re-bake; pairs with a new APK)"
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -43,11 +52,14 @@ jobs:
         run: python3 scripts/build_catalog.py --db build/candidate.db
 
       # 3. last published state -> prev baseline + last content version
+      #    (manifest lives on GitHub Pages; its baseline URL points to a
+      #    release asset)
       - name: Fetch last published state
         run: |
           set -e
+          PAGES_BASE="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY##*/}"
           mkdir -p build
-          if curl -sf "${{ vars.CATALOG_BASE_URL }}/manifest.json" -o build/last_manifest.json; then
+          if curl -sf "${PAGES_BASE}/manifest.json" -o build/last_manifest.json; then
             echo "  found last manifest (cv $(python3 -c "import json;print(json.load(open('build/last_manifest.json'))['content_version'])"))"
             PREV_URL=$(python3 -c "import json;print(json.load(open('build/last_manifest.json'))['baseline']['url'])")
             curl -sf "$PREV_URL" -o build/prev.db
@@ -59,11 +71,19 @@ jobs:
             echo "LAST_CV=0" >> "$GITHUB_ENV"
           fi
 
-      # 4. diff vs last baseline -> overlay (exit 42 = no content change)
+      # 4. diff vs last baseline -> overlay (exit 42 = no content change).
+      #    The published baseline is the one we diffed against — NOT the
+      #    candidate — so content days publish only the small overlay.
+      #    (rebase dispatch: PREV=none forces candidate as new baseline.)
       - name: Diff vs last baseline
         run: |
           set -e
-          [ -f build/prev.db ] && PREV=build/prev.db || PREV=none
+          if [ "${{ inputs.rebase }}" = "true" ]; then
+            echo "::notice::rebase requested — new baseline = candidate"
+            PREV=none
+          else
+            [ -f build/prev.db ] && PREV=build/prev.db || PREV=none
+          fi
           BSHA=$(sha256sum build/candidate.db | cut -d' ' -f1)
           set +e
           python3 scripts/diff_catalog.py --prev "$PREV" \
@@ -72,32 +92,70 @@ jobs:
             --content-version $(( LAST_CV + 1 ))
           RC=$?
           set -e
-          [ $RC -eq 42 ] && echo "::notice::no content change, nothing published" && exit 0
+          if [ $RC -eq 42 ]; then
+            echo "::notice::no content change, nothing published"
+            echo "PUBLISH=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
           [ $RC -ne 0 ] && exit $RC
-          cp build/candidate.db build/published_baseline.db
+          if [ "$PREV" = "none" ]; then
+            cp build/candidate.db build/published_baseline.db
+          else
+            cp build/prev.db build/published_baseline.db
+          fi
 
-      # 5. stage manifest + upload (R2) — the published baseline is the
-      #    last one we diffed against (re-PUT, idempotent, content-addressed)
-      - name: Publish
-        env:
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-        run: |
-          [ -f build/published_baseline.db ] || cp build/candidate.db build/published_baseline.db
-          python3 scripts/publish.py \
-            --baseline build/published_baseline.db \
-            --overlay build/overlay.sqlite \
-            --base-url "${{ vars.CATALOG_BASE_URL }}" \
-            --upload --keep-dist
-
-      # 6. GitHub Releases mirror (app fallback host)
-      - name: Release mirror
+      # 5. baseline -> release asset, only when the baseline sha is new.
+      #    (~124 MB exceeds the 100 MB git push limit, so it cannot live on
+      #    the Pages branch; the Releases API allows 2 GiB per asset.)
+      - name: Publish baseline (release asset)
+        if: env.PUBLISH != 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          VER=$(python3 -c "import json;print(json.load(open('dist/manifest.json'))['content_version'])")
-          gh release create "catalog-$VER" --title "catalog content $VER" \
-            dist/baselines/ dist/overlays/ dist/manifest.json --notes "auto"
+          BSHA=$(sha256sum build/published_baseline.db | cut -c1-12)
+          TAG="baseline-${BSHA}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "  baseline $TAG already published"
+          else
+            cp build/published_baseline.db "build/${BSHA}.db"
+            gh release create "$TAG" --title "catalog baseline $BSHA" \
+              --notes "content-addressed catalog baseline (immutable)" "build/${BSHA}.db"
+          fi
+          echo "BASELINE_URL=https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${BSHA}.db" >> "$GITHUB_ENV"
+
+      # 6. stage dist/ + manifest.json (absolute URLs: baseline -> release
+      #    asset, overlay -> Pages). No upload here — Pages is the host.
+      - name: Stage manifest
+        if: env.PUBLISH != 'false'
+        run: |
+          set -e
+          PAGES_BASE="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY##*/}"
+          python3 scripts/publish.py \
+            --baseline build/published_baseline.db \
+            --overlay build/overlay.sqlite \
+            --base-url "$PAGES_BASE" \
+            --baseline-url "$BASELINE_URL" \
+            --keep-dist
+
+      # 7. manifest + current overlay -> gh-pages branch. Fresh single-commit
+      #    branch force-pushed each time (constant size, no history bloat).
+      #    One-time setup: repo Settings -> Pages -> Source "Deploy from a
+      #    branch" -> branch `gh-pages`, root.
+      - name: Push to GitHub Pages
+        if: env.PUBLISH != 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TMP=$(mktemp -d)
+          git init -q -b gh-pages "$TMP/pages"
+          git -C "$TMP/pages" config user.name "github-actions"
+          git -C "$TMP/pages" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp dist/manifest.json "$TMP/pages/"
+          cp -r dist/overlays "$TMP/pages/"
+          git -C "$TMP/pages" add -A
+          git -C "$TMP/pages" commit -qm "catalog cv$(python3 -c "import json;print(json.load(open('dist/manifest.json'))['content_version'])")"
+          git -C "$TMP/pages" remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$TMP/pages" push -qf origin gh-pages
+          echo "  Pages live (deploy ~1-2 min): https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY##*/}"
