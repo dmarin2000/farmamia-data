@@ -30,6 +30,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # new repos default to read-only workflow tokens; push to gh-pages and
+    # baseline release creation need contents:write
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
