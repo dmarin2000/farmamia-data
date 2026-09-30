@@ -1,0 +1,22 @@
+{
+  "schema_version": "4",
+  "content_version": "2",
+  "baseline": {
+    "url": "https://github.com/dmarin2000/farmamia-data/releases/download/baseline-894124ba9081/894124ba9081.db",
+    "sha256": "894124ba90814a4d0b648e111d8274f3914f30d1ea7525295bb0ca9f1d6724f1",
+    "size": 129687552
+  },
+  "overlay": {
+    "url": "https://dmarin2000.github.io/farmamia-data/overlays/overlay_2.sqlite",
+    "sha256": "b6d719936c0d46a1e5bb9ba00f24742b9717af81d1f8808f903ba905f959e8f8",
+    "size": 159744,
+    "baseline_sha256": "894124ba90814a4d0b648e111d8274f3914f30d1ea7525295bb0ca9f1d6724f1"
+  },
+  "sources": {
+    "registro": "2026-09-14",
+    "dispo": "2026-09-14",
+    "classe_ah": "2026-09-14",
+    "pa": "2026-09-14"
+  },
+  "generated_at": "2026-09-30T12:04:55.053245+00:00"
+}
