@@ -11,5 +11,6 @@ backups/
 !curated/*.csv
 # reference screenshots
 *.png
+*.md
 __pycache__/
 .DS_Store
