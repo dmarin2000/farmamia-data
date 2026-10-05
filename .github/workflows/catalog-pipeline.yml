@@ -41,6 +41,16 @@ jobs:
         with:
           python-version: "3.11"   # pipeline is stdlib-only
 
+      # sources/.manifest.json is gitignored — restore it from the previous
+      # run's artifact so --skip-unchanged can HEAD-probe and skip unchanged
+      # sources instead of re-downloading the full ~100 MB every day.
+      - name: Restore source manifest
+        continue-on-error: true   # first run: no artifact yet
+        uses: actions/download-artifact@v4
+        with:
+          name: source-manifest
+          path: sources/
+
       # 1. fetch + validate sources (fail-closed, per-source staleness bands)
       #    MIBACT_PROXY (optional secret): the Mibact DISPO host is a
       #    TLS1.2-only box that can reject the runner egress; if both the
@@ -50,6 +60,17 @@ jobs:
         env:
           MIBACT_PROXY: ${{ secrets.MIBACT_PROXY }}
         run: python3 scripts/download_sources.py --skip-unchanged
+
+      # persist what finished this run (the script saves the manifest after
+      # each source) so the next run can skip unchanged sources — even when
+      # a later step fails
+      - name: Persist source manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-manifest
+          path: sources/.manifest.json
+          if-no-files-found: ignore
 
       # 2. full candidate build
       - name: Build candidate catalog

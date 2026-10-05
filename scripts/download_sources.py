@@ -24,7 +24,10 @@ Fail-closed (plan §6): files download to <name>.part and are validated
 the last-good copy. A failed validation leaves the previous file
 intact. Staleness = days since the file's sha256 last changed; bands
 per source (days): warn/fail. A source whose content hasn't moved past
-the fail band aborts the run (--allow-stale to override).
+the fail band aborts the run (--allow-stale to override). The flaky
+AIFA hosts get retry-with-backoff on every request, and the classe
+list-page resolution degrades (last-resolved URL, then last-known-good
+constant) instead of aborting the run.
 
 Usage:
   python3 download_sources.py                       # all sources
@@ -40,12 +43,14 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import http.client
 import json
 import os
 import re
 import ssl
 import subprocess
 import sys
+import time
 import urllib.request
 import urllib.error
 import zipfile
@@ -107,22 +112,42 @@ def make_opener(domain: str) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
 
+def _get_bytes(opener, url: str, ua: str, timeout: int, attempts: int = 3,
+               backoff: tuple = (5, 15)) -> tuple[bytes, int, dict]:
+    """GET with retry. Catches transient transport failures — WAF stalls
+    (TimeoutError), resets, TLS errors, truncated bodies (HTTPException) —
+    and re-tries with backoff; raises the last error when all attempts
+    fail. (In 3.11 TimeoutError, URLError and SSLError are all OSError.)"""
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": ua})
+            with opener.open(req, timeout=timeout) as resp:
+                return resp.read(), resp.status, dict(resp.headers)
+        except (OSError, http.client.HTTPException) as e:
+            last = e
+            if i < attempts - 1:
+                wait = backoff[min(i, len(backoff) - 1)]
+                print(f"  transient {type(e).__name__} ({e}) — retry "
+                      f"{i + 1}/{attempts - 1} in {wait}s")
+                time.sleep(wait)
+    assert last is not None
+    raise last
+
+
 def fetch(opener, url: str, dest: str, timeout: int = 300, getter=None) -> dict:
     """Download to <dest>.part. The caller validates the part, then
     promotes it with os.replace (fail-closed: the last-good file is
     only touched after the new one is known good).
 
     getter: optional callable (url, timeout) -> (bytes, headers) used
-    instead of the default urllib path (the Mibact host needs one)."""
+    instead of the default urllib path (the Mibact host needs one; it
+    already does its own urllib->curl failover)."""
     if getter is not None:
         data, headers = getter(url, timeout)
         status = 200
     else:
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with opener.open(req, timeout=timeout) as resp:
-            data = resp.read()
-            status = resp.status
-            headers = resp.headers
+        data, status, headers = _get_bytes(opener, url, USER_AGENT, timeout)
     tmp = dest + ".part"
     with open(tmp, "wb") as f:
         f.write(data)
@@ -245,14 +270,46 @@ def check_staleness(name: str, meta: dict, manifest: dict, allow_stale: bool) ->
         print(f"  WARN: source {name}: content unchanged for {age}d (warn band {warn_d}d)")
 
 
-def resolve_latest_classe(opener, kind: str) -> str:
-    """kind = 'A' or 'H'. Fetch the AIFA list page, pick the newest dated
-    Classe_<kind>_per_nome_commerciale CSV, fall back to the last-known URL."""
-    # AIFA's WAF 403s urllib's default UA on www.aifa.gov.it — use a browser
-    # UA for this one request (drive.aifa.gov.it accepts the pipeline UA).
-    req = urllib.request.Request(AIFA_LIST_PAGE, headers={"User-Agent": BROWSER_UA})
-    with opener.open(req, timeout=60) as resp:
-        html = resp.read().decode("utf-8", errors="ignore")
+def resolve_latest_classe(opener, kind: str, manifest: dict) -> str:
+    """kind = 'A' or 'H'. Pick the newest dated Classe_<kind>_per_nome_
+    commerciale CSV from the AIFA list page. The list page sits on the
+    WAF-fronted Liferay host that intermittently accepts the connection
+    and then stalls (a run died on a bare 60 s TimeoutError), so this
+    degrades in three steps instead of aborting:
+      1. the manifest holds a resolved URL whose file date is <14 d old
+         -> reuse it and skip the list page (A/H republish at AIFA's
+         whim, 5+ months is normal);
+      2. GET the list page with retry (browser UA — the WAF 403s the
+         pipeline UA; drive.aifa.gov.it accepts it);
+      3. final transport failure or unparseable HTML -> last-resolved
+         URL, else the hardcoded last-known-good. A stale-but-downloadable
+         file beats a dead pipeline: the staleness gate bounds its age."""
+    source = f"aifa_classe_{kind.lower()}"
+    old_url = (manifest.get("files", {}).get(source) or {}).get("url")
+    if old_url:
+        m = re.search(r"(\d{2}-\d{2}-\d{4})\.csv$",
+                      os.path.basename(urlparse(old_url).path))
+        if m:
+            try:
+                d = datetime.strptime(m.group(1), "%d-%m-%Y")
+            except ValueError:
+                d = None
+            if d is not None and (datetime.now(timezone.utc)
+                                  - d.replace(tzinfo=timezone.utc)).days < 14:
+                print(f"  reusing last resolved classe {kind} URL ({m.group(1)})")
+                return old_url
+    fallback = FALLBACK_CLASSE_A if kind == "A" else FALLBACK_CLASSE_H
+    try:
+        html, _status, _headers = _get_bytes(opener, AIFA_LIST_PAGE, BROWSER_UA, 90)
+    except (OSError, http.client.HTTPException) as e:
+        print(f"  WARN: list page unreachable after retries "
+              f"({type(e).__name__}: {e})")
+        if old_url:
+            print(f"  using last resolved classe {kind} URL")
+            return old_url
+        print(f"  using fallback classe {kind} URL")
+        return fallback
+    html = html.decode("utf-8", errors="ignore")
     pat = re.compile(r"(/documents/[^\"']+Classe_" + kind +
                      r"_per_nome_commerciale_(\d{2}-\d{2}-\d{4})\.csv)")
     dates = []
@@ -266,8 +323,12 @@ def resolve_latest_classe(opener, kind: str) -> str:
         dates.sort()
         newest = dates[-1]
         return urljoin(AIFA_LIST_PAGE, newest[1])
-    print(f"  WARN: could not parse {kind} list links, using fallback URL")
-    return FALLBACK_CLASSE_A if kind == "A" else FALLBACK_CLASSE_H
+    print(f"  WARN: could not parse {kind} list links")
+    if old_url:
+        print(f"  using last resolved classe {kind} URL")
+        return old_url
+    print(f"  using fallback classe {kind} URL")
+    return fallback
 
 
 def resolve_mibact(opener) -> tuple[str, str]:
@@ -327,7 +388,8 @@ def main() -> None:
                     help="warn instead of failing on past-fail-band staleness")
     args = ap.parse_args()
 
-    names = args.only or list(EXPECTED_FIRST_HEADER)
+    names = [n.strip() for flag in (args.only or []) for n in flag.split(",")]
+    names = names or list(EXPECTED_FIRST_HEADER)
     for n in names:
         if n not in EXPECTED_FIRST_HEADER:
             raise SystemExit(f"unknown source {n!r}")
@@ -349,7 +411,7 @@ def main() -> None:
         if name in targets:
             opener, url = targets[name]
         elif name in ("aifa_classe_a", "aifa_classe_h"):
-            opener, url = aifa, resolve_latest_classe(aifa, name[-1].upper())
+            opener, url = aifa, resolve_latest_classe(aifa, name[-1].upper(), manifest)
         elif name == "mibact_dispo":
             opener, url = salute, None  # resolved below
         else:
