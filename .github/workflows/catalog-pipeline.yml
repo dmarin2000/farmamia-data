@@ -111,7 +111,15 @@ jobs:
           else
             [ -f build/prev.db ] && PREV=build/prev.db || PREV=none
           fi
-          BSHA=$(sha256sum build/candidate.db | cut -d' ' -f1)
+          # The overlay stamps content_meta.baseline_sha256 with this value;
+          # the app compares it against its on-disk baseline file. So it must
+          # be the sha of the PUBLISHED baseline (prev on content days), not
+          # the candidate's (only prev=none publishes the candidate itself).
+          if [ "$PREV" = "none" ]; then
+            BSHA=$(sha256sum build/candidate.db | cut -d' ' -f1)
+          else
+            BSHA=$(sha256sum build/prev.db | cut -d' ' -f1)
+          fi
           set +e
           python3 scripts/diff_catalog.py --prev "$PREV" \
             --cand build/candidate.db --out build/overlay.sqlite \

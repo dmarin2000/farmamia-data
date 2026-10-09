@@ -38,6 +38,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sqlite3
 import sys
@@ -87,13 +88,36 @@ def main() -> None:
     ap.add_argument("--cand", required=True, help="candidate full build db")
     ap.add_argument("--out", required=True, help="overlay sqlite path")
     ap.add_argument("--baseline-sha", required=True,
-                    help="sha256 of the baseline file (hex)")
+                    help="sha256 (hex) of the PUBLISHED baseline: the --prev "
+                         "db when diffing, or the --cand db when --prev none. "
+                         "Stamped into content_meta.baseline_sha256; the app "
+                         "rejects an overlay whose stamp != its baseline file.")
     ap.add_argument("--content-version", type=int, default=None,
                     help="default: read from candidate catalog_meta")
     args = ap.parse_args()
 
     if args.prev.lower() != "none" and not os.path.exists(args.prev):
         raise SystemExit(f"ERROR: prev db missing: {args.prev}")
+
+    # Fail-closed stamp check (PLAN §5): the published baseline is prev when
+    # diffing, the candidate when --prev none. The app compares
+    # content_meta.baseline_sha256 against its on-disk baseline file, so a
+    # wrong stamp here (e.g. the candidate's sha on a content day) makes the
+    # app silently discard a perfectly good overlay — pin it here.
+    def file_sha(path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    expect_src = args.cand if args.prev.lower() == "none" else args.prev
+    expect = file_sha(expect_src)
+    if args.baseline_sha.lower() != expect:
+        raise SystemExit(
+            f"ERROR: --baseline-sha {args.baseline_sha[:12]}… != sha256({expect_src}) "
+            f"{expect[:12]}… — the published baseline is {os.path.basename(expect_src)}; "
+            f"stamp the overlay with THAT sha or the app rejects it")
 
     def meta_of(path: str) -> dict:
         return dict(sqlite3.connect(f"file:{path}?mode=ro", uri=True)

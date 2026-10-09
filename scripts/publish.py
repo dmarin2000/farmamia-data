@@ -145,6 +145,13 @@ def main() -> None:
     shutil.copy2(args.baseline, os.path.join(dist, base_key))
     shutil.copy2(args.overlay, os.path.join(dist, ovl_key))
 
+    # Source dates: prefer the overlay's content_meta (provenance of the
+    # CANDIDATE build = newest) over the baseline's catalog_meta (frozen at
+    # the last rebase). The app reads its own DB meta, not this block, so
+    # this only keeps the manifest honest.
+    def src_date(overlay_key: str, baseline_key: str) -> str:
+        return ometa.get(overlay_key) or bmeta.get(baseline_key, "")
+
     manifest = {
         "schema_version": bmeta["schema_version"],
         "content_version": cv,
@@ -160,10 +167,10 @@ def main() -> None:
             "baseline_sha256": base_sha,
         },
         "sources": {
-            "registro": bmeta.get("registro_date", ""),
-            "dispo": bmeta.get("dispo_date", ""),
-            "classe_ah": bmeta.get("classa_date", ""),
-            "pa": bmeta.get("pa_date", ""),
+            "registro": src_date("registro_date", "registro_date"),
+            "dispo": src_date("dispo_date", "dispo_date"),
+            "classe_ah": src_date("classa_date", "classa_date"),
+            "pa": src_date("pa_date", "pa_date"),
         },
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
